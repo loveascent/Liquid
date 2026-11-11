@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Liquid Light</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#cde}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#hud{position:fixed;left:14px;bottom:12px;font-size:12px;opacity:.7;line-height:1.6;user-select:none}
+#hud b{color:#fff}
+#err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#f88}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="hud"><b>Liquid Light</b> · Navier-Stokes auf der GPU<br>Maus/Touch: Farbe verwirbeln · Klick: Explosion · <b>Leertaste</b> Autopilot · <b>B</b> Bloom · <b>C</b> Reset · <b>H</b> HUD</div>
+<div id="err">WebGL2 mit Float-Rendering wird nicht unterstützt.</div>
+<script>
+"use strict";
+const canvas=document.getElementById('c');
+const gl=canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false});
+if(!gl||!gl.getExtension('EXT_color_buffer_float')){document.getElementById('err').style.display='flex';throw 0}
+gl.getExtension('OES_texture_float_linear');
+const cfg={SIM:256,DYE:1024,DENS_DISS:0.985,VEL_DISS:0.2,PRESSURE:0.8,ITER:20,CURL:32,SPLAT_R:0.0025,BLOOM:true};
+const VS=`#version 300 es
+in vec2 p;out vec2 uv;out vec2 L,R,T,B;uniform vec2 tx;
+void main(){uv=p*.5+.5;L=uv-vec2(tx.x,0);R=uv+vec2(tx.x,0);T=uv+vec2(0,tx.y);B=uv-vec2(0,tx.y);gl_Position=vec4(p,0,1);}`;
+const H=`#version 300 es
+precision highp float;precision highp sampler2D;in vec2 uv,L,R,T,B;out vec4 o;`;
+function sh(t,s){const x=gl.createShader(t);gl.shaderSource(x,s);gl.compileShader(x);if(!gl.getShaderParameter(x,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(x),s);return x}
+function prog(fs){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,VS));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,H+fs));gl.bindAttribLocation(p,0,'p');gl.linkProgram(p);
+ const u={};const n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);for(let i=0;i<n;i++){const k=gl.getActiveUniform(p,i).name;u[k]=gl.getUniformLocation(p,k)}return{p,u}}
+const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,-1,1,1,1,1,-1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+const idx=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idx);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2,0,2,3]),gl.STATIC_DRAW);
+
+const P={
+ splat:prog(`uniform sampler2D t;uniform float ar,r;uniform vec3 col;uniform vec2 pt;
+  void main(){vec2 d=uv-pt;d.x*=ar;vec3 s=exp(-dot(d,d)/r)*col;o=vec4(texture(t,uv).rgb+s,1);}`),
+ adv:prog(`uniform sampler2D v,s;uniform vec2 ts;uniform float dt,diss;
+  void main(){vec2 c=uv-dt*texture(v,uv).xy*ts;o=texture(s,c)/(1.+diss*dt);}`),
+ div:prog(`uniform sampler2D v;void main(){float l=texture(v,L).x,r=texture(v,R).x,t=texture(v,T).y,b=texture(v,B).y;
+  vec2 c=texture(v,uv).xy;if(L.x<0.)l=-c.x;if(R.x>1.)r=-c.x;if(T.y>1.)t=-c.y;if(B.y<0.)b=-c.y;o=vec4(.5*(r-l+t-b),0,0,1);}`),
+ curl:prog(`uniform sampler2D v;void main(){float l=texture(v,L).y,r=texture(v,R).y,t=texture(v,T).x,b=texture(v,B).x;o=vec4(.5*(r-l-t+b),0,0,1);}`),
+ vort:prog(`uniform sampler2D v,cu;uniform float k,dt;void main(){
+  float l=texture(cu,L).x,r=texture(cu,R).x,t=texture(cu,T).x,b=texture(cu,B).x,c=texture(cu,uv).x;
+  vec2 f=.5*vec2(abs(t)-abs(b),abs(r)-abs(l));f/=length(f)+1e-4;f*=k*c;f.y*=-1.;
+  vec2 vel=texture(v,uv).xy+f*dt;o=vec4(clamp(vel,-1000.,1000.),0,1);}`),
+ press:prog(`uniform sampler2D p,d;void main(){float l=texture(p,L).x,r=texture(p,R).x,t=texture(p,T).x,b=texture(p,B).x;o=vec4((l+r+b+t-texture(d,uv).x)*.25,0,0,1);}`),
+ clear:prog(`uniform sampler2D t;uniform float v;void main(){o=v*texture(t,uv);}`),
+ grad:prog(`uniform sampler2D p,v;void main(){float l=texture(p,L).x,r=texture(p,R).x,t=texture(p,T).x,b=texture(p,B).x;
+  o=vec4(texture(v,uv).xy-vec2(r-l,t-b),0,1);}`),
+ bright:prog(`uniform sampler2D t;void main(){vec3 c=texture(t,uv).rgb;float b=max(c.r,max(c.g,c.b));o=vec4(c*max(b-.55,0.)/max(b,1e-3),1);}`),
+ blur:prog(`uniform sampler2D t;uniform vec2 dir;void main(){
+  vec3 s=texture(t,uv).rgb*.227027;
+  s+=texture(t,uv+dir*1.3846).rgb*.3162+texture(t,uv-dir*1.3846).rgb*.3162;
+  s+=texture(t,uv+dir*3.2308).rgb*.0703+texture(t,uv-dir*3.2308).rgb*.0703;
+  o=vec4(s*.5,1);}`),
+ show:prog(`uniform sampler2D t,bl;uniform float bloom,time;
+  void main(){vec3 c=texture(t,uv).rgb;
+   c+=texture(bl,uv).rgb*bloom*1.4;
+   // Glanzlichter: Dichtegradient als Normale
+   float l=dot(texture(t,L).rgb,vec3(.33)),r=dot(texture(t,R).rgb,vec3(.33)),tt=dot(texture(t,T).rgb,vec3(.33)),b=dot(texture(t,B).rgb,vec3(.33));
+   vec3 n=normalize(vec3(l-r,b-tt,.06));float spec=pow(max(dot(n,normalize(vec3(-.4,.6,.7))),0.),24.);
+   c+=spec*smoothstep(.02,.5,dot(c,vec3(.33)))*.35;
+   c=1.-exp(-c*1.25);c=pow(c,vec3(.92));
+   vec2 q=uv-.5;c*=1.-dot(q,q)*.9;o=vec4(c,1);}`)
+};
+const mk=(w,h,f,filt)=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filt);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filt);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ gl.texImage2D(gl.TEXTURE_2D,0,f[0],w,h,0,f[1],gl.HALF_FLOAT,null);
+ const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+ return{t,fb,w,h,tx:[1/w,1/h]}};
+const dbl=(w,h,f,filt)=>{let a=mk(w,h,f,filt),b=mk(w,h,f,filt);return{get r(){return a},get w(){return b},swap(){[a,b]=[b,a]}}};
+const RGBA=[gl.RGBA16F,gl.RGBA],RG=[gl.RG16F,gl.RG],R1=[gl.R16F,gl.RED];
+let vel,dye,div,curl,pr,bl1,bl2,bl3;
+function res(n){const a=canvas.width/canvas.height;return a>=1?[Math.round(n*a),n]:[n,Math.round(n/a)]}
+function init(){const s=res(cfg.SIM),d=res(cfg.DYE),b=res(256);
+ vel=dbl(...s,RG,gl.LINEAR);dye=dbl(...d,RGBA,gl.LINEAR);div=mk(...s,R1,gl.NEAREST);curl=mk(...s,R1,gl.NEAREST);pr=dbl(...s,R1,gl.NEAREST);
+ bl1=mk(...b,RGBA,gl.LINEAR);bl2=mk(...b,RGBA,gl.LINEAR)}
+function resize(){const dpr=Math.min(devicePixelRatio||1,2);const w=Math.floor(innerWidth*dpr),h=Math.floor(innerHeight*dpr);if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;init()}}
+function use(p){gl.useProgram(p.p);return p.u}
+function bind(u,name,tex,i){gl.activeTexture(gl.TEXTURE0+i);gl.bindTexture(gl.TEXTURE_2D,tex);gl.uniform1i(u[name],i)}
+function draw(target){if(target){gl.viewport(0,0,target.w,target.h);gl.bindFramebuffer(gl.FRAMEBUFFER,target.fb)}else{gl.viewport(0,0,canvas.width,canvas.height);gl.bindFramebuffer(gl.FRAMEBUFFER,null)}gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0)}
+function splat(x,y,dx,dy,col,rad=cfg.SPLAT_R){
+ let u=use(P.splat);gl.uniform2fv(u.tx,vel.r.tx);gl.uniform1f(u.ar,canvas.width/canvas.height);gl.uniform1f(u.r,rad);
+ bind(u,'t',vel.r.t,0);gl.uniform2f(u.pt,x,y);gl.uniform3f(u.col,dx,dy,0);draw(vel.w);vel.swap();
+ bind(u,'t',dye.r.t,0);gl.uniform3f(u.col,col[0],col[1],col[2]);draw(dye.w);dye.swap()}
+function hsv(h,s,v){const i=Math.floor(h*6),f=h*6-i,p=v*(1-s),q=v*(1-f*s),t=v*(1-(1-f)*s);return[[v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]][i%6]}
+let hue=Math.random();const col=(k=.9)=>{hue=(hue+.0035)%1;return hsv(hue,.85,k)};
+function step(dt){
+ gl.disable(gl.BLEND);
+ let u=use(P.curl);gl.uniform2fv(u.tx,vel.r.tx);bind(u,'v',vel.r.t,0);draw(curl);
+ u=use(P.vort);gl.uniform2fv(u.tx,vel.r.tx);bind(u,'v',vel.r.t,0);bind(u,'cu',curl.t,1);gl.uniform1f(u.k,cfg.CURL);gl.uniform1f(u.dt,dt);draw(vel.w);vel.swap();
+ u=use(P.div);gl.uniform2fv(u.tx,vel.r.tx);bind(u,'v',vel.r.t,0);draw(div);
+ u=use(P.clear);gl.uniform2fv(u.tx,pr.r.tx);bind(u,'t',pr.r.t,0);gl.uniform1f(u.v,cfg.PRESSURE);draw(pr.w);pr.swap();
+ u=use(P.press);gl.uniform2fv(u.tx,vel.r.tx);bind(u,'d',div.t,1);
+ for(let i=0;i<cfg.ITER;i++){bind(u,'p',pr.r.t,0);draw(pr.w);pr.swap()}
+ u=use(P.grad);gl.uniform2fv(u.tx,vel.r.tx);bind(u,'p',pr.r.t,0);bind(u,'v',vel.r.t,1);draw(vel.w);vel.swap();
+ u=use(P.adv);gl.uniform2fv(u.tx,vel.r.tx);gl.uniform2fv(u.ts,vel.r.tx);bind(u,'v',vel.r.t,0);bind(u,'s',vel.r.t,1);gl.uniform1f(u.dt,dt);gl.uniform1f(u.diss,cfg.VEL_DISS);draw(vel.w);vel.swap();
+ gl.uniform2fv(u.tx,dye.r.tx);gl.uniform2fv(u.ts,vel.r.tx);bind(u,'v',vel.r.t,0);bind(u,'s',dye.r.t,1);gl.uniform1f(u.diss,1-cfg.DENS_DISS+.1);draw(dye.w);dye.swap()}
+function render(t){
+ let u;
+ if(cfg.BLOOM){u=use(P.bright);gl.uniform2fv(u.tx,bl1.tx);bind(u,'t',dye.r.t,0);draw(bl1);
+  u=use(P.blur);for(let i=0;i<3;i++){gl.uniform2fv(u.tx,bl1.tx);gl.uniform2f(u.dir,bl1.tx[0]*(1+i),0);bind(u,'t',bl1.t,0);draw(bl2);
+   gl.uniform2f(u.dir,0,bl1.tx[1]*(1+i));bind(u,'t',bl2.t,0);draw(bl1)}}
+ u=use(P.show);gl.uniform2fv(u.tx,dye.r.tx);bind(u,'t',dye.r.t,0);bind(u,'bl',bl1.t,1);gl.uniform1f(u.bloom,cfg.BLOOM?1:0);gl.uniform1f(u.time,t);draw(null)}
+// Eingabe
+const ptr={x:0,y:0,px:0,py:0,down:false,moved:false};let auto=true,lastInput=0;
+function pos(e){return[e.clientX/innerWidth,1-e.clientY/innerHeight]}
+addEventListener('pointerdown',e=>{ptr.down=true;[ptr.x,ptr.y]=pos(e);[ptr.px,ptr.py]=[ptr.x,ptr.y];lastInput=performance.now();
+ const c=col(1.1);for(let i=0;i<10;i++){const a=i/10*6.283;splat(ptr.x,ptr.y,Math.cos(a)*900,Math.sin(a)*900,c.map(v=>v*.5),.004)}});
+addEventListener('pointerup',()=>ptr.down=false);
+addEventListener('pointermove',e=>{[ptr.px,ptr.py]=[ptr.x,ptr.y];[ptr.x,ptr.y]=pos(e);ptr.moved=true;lastInput=performance.now()});
+addEventListener('keydown',e=>{const k=e.key.toLowerCase();
+ if(k===' '){auto=!auto;e.preventDefault()}if(k==='b')cfg.BLOOM=!cfg.BLOOM;if(k==='c')init();
+ if(k==='h')document.getElementById('hud').style.display=document.getElementById('hud').style.display==='none'?'':'none'});
+// Autopilot: Lissajous-Bahnen
+let at=0;function autopilot(dt){at+=dt;for(let i=0;i<2;i++){const s=at*(.5+i*.37)+i*3;
+ const x=.5+.38*Math.sin(s*1.3+i)*Math.cos(s*.31),y=.5+.34*Math.sin(s*1.7+i*2.1);
+ const vx=Math.cos(s*1.3+i)*1.3*.38*Math.cos(s*.31),vy=Math.cos(s*1.7+i*2.1)*1.7*.34;
+ splat(x,y,vx*2200*dt*60/60,vy*2200*dt*60/60,col(.55),.0016)}
+ if(Math.random()<dt*.7){const x=Math.random(),y=Math.random(),a=Math.random()*6.28;const c=col(1);for(let i=0;i<12;i++){const b=a+i/12*6.28;splat(x,y,Math.cos(b)*500,Math.sin(b)*500,c.map(v=>v*.25),.003)}}}
+resize();addEventListener('resize',resize);
+let last=performance.now();
+function frame(now){resize();const dt=Math.min((now-last)/1000,1/30);last=now;
+ if(ptr.down||ptr.moved){const dx=(ptr.x-ptr.px)*900,dy=(ptr.y-ptr.py)*900;if(ptr.down||Math.abs(dx)+Math.abs(dy)>0.5)splat(ptr.x,ptr.y,dx,dy,col(.7));ptr.moved=false}
+ if(auto&&now-lastInput>2500)autopilot(dt);
+ step(dt);render(now/1000);requestAnimationFrame(frame)}
+requestAnimationFrame(frame);
+</script></body></html>

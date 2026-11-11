@@ -1,0 +1,9 @@
+﻿kaffee-blender/frames*/
+kaffee-blender/test*/
+kaffee-blender/cache/
+kaffee-blender/*.blend
+kaffee-blender/*.blend1
+kaffee-blender/dbg_*.png
+kaffee-blender/render.log
+kaffee-blender/render.err
+__pycache__/

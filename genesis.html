@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Genesis</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#cde}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+#ui{position:fixed;left:14px;top:14px;display:flex;flex-direction:column;gap:6px;z-index:2}
+#ui button{background:#0b1220cc;color:#cfe3ff;border:1px solid #2a3b5c;border-radius:8px;padding:8px 14px;font:600 13px system-ui;cursor:pointer;text-align:left;backdrop-filter:blur(6px)}
+#ui button:hover,#ui button.on{background:#1b2d52;border-color:#6fa3ff}
+#info{position:fixed;right:16px;bottom:14px;text-align:right;font-size:13px;opacity:.85;line-height:1.5;z-index:2}
+#info b{font-size:20px;color:#fff;display:block}
+#err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#f88}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="ui"></div>
+<div id="info"></div>
+<div id="err">WebGL wird nicht unterstützt.</div>
+<script>
+"use strict";
+const canvas=document.getElementById('c');
+const gl=canvas.getContext('webgl2',{antialias:false});
+if(!gl){document.getElementById('err').style.display='flex';throw 0}
+const VS=`#version 300 es
+in vec2 p;void main(){gl_Position=vec4(p,0,1);}`;
+const FS=`#version 300 es
+precision highp float;out vec4 o;
+uniform vec2 res;uniform float time,seed,type,ring,yaw,pitch,zoom;
+// Paletten je Typ: 0 erdähnlich, 1 Wüste, 2 Eis, 3 Lava, 4 Gasriese, 5 Ozean
+float h31(vec3 p){p=fract(p*.3183099+.1);p*=17.;return fract(p.x*p.y*p.z*(p.x+p.y+p.z));}
+float n3(vec3 x){vec3 i=floor(x),f=fract(x);f=f*f*(3.-2.*f);
+ return mix(mix(mix(h31(i),h31(i+vec3(1,0,0)),f.x),mix(h31(i+vec3(0,1,0)),h31(i+vec3(1,1,0)),f.x),f.y),
+            mix(mix(h31(i+vec3(0,0,1)),h31(i+vec3(1,0,1)),f.x),mix(h31(i+vec3(0,1,1)),h31(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float fbm(vec3 p,int oct){float a=.5,s=0.;for(int i=0;i<8;i++){if(i>=oct)break;s+=a*n3(p);p=p*2.03+vec3(1.7,9.2,3.1);a*=.5;}return s;}
+mat3 rotY(float a){float c=cos(a),s=sin(a);return mat3(c,0,-s,0,1,0,s,0,c);}
+mat3 rotX(float a){float c=cos(a),s=sin(a);return mat3(1,0,0,0,c,s,0,-s,c);}
+vec3 stars(vec3 d){vec3 c=vec3(0);vec3 p=d*180.;vec3 i=floor(p);float h=h31(i+seed);
+ float s=step(.9965,h)*smoothstep(.5,0.,length(fract(p)-.5));c+=s*mix(vec3(.7,.8,1.),vec3(1,.85,.7),h31(i+7.));
+ c+=vec3(.04,.05,.09)*pow(fbm(d*2.5+seed,5),3.)*2.;return c;}
+// Höhenfeld + Material
+struct S{vec3 alb;float rough;float h;float ice;float water;};
+S surf(vec3 q){S s;float cont=fbm(q*1.6+seed*3.1,6);float det=fbm(q*7.+seed,5);float h=cont+.12*det;s.h=h;s.ice=0.;s.water=0.;s.rough=.8;
+ float lat=abs(q.y);
+ if(type<.5){ // erdähnlich
+  float sea=.52;if(h<sea){s.water=1.;float d=(sea-h)*5.;s.alb=mix(vec3(.02,.2,.4),vec3(.0,.03,.14),clamp(d,0.,1.));}
+  else{float e=(h-sea)*4.;float moist=fbm(q*3.+seed*7.,4);vec3 gr=mix(vec3(.08,.28,.06),vec3(.3,.36,.1),moist);vec3 dr=vec3(.42,.33,.22);
+   s.alb=mix(mix(gr,dr,smoothstep(.4,.7,1.-moist+lat*.2)),vec3(.5,.46,.42),smoothstep(.2,.7,e));
+   s.alb=mix(s.alb,vec3(.92),smoothstep(.76,.9,lat+e*.15));s.ice=step(.8,lat+e*.15);}
+  if(h<sea)s.alb=mix(s.alb,vec3(.9,.95,1.),smoothstep(.86,.95,lat));
+ }else if(type<1.5){ // Wüste/Mars
+  float d=fbm(q*4.+seed,5);s.alb=mix(vec3(.55,.24,.1),vec3(.85,.55,.3),h);s.alb=mix(s.alb,vec3(.3,.12,.07),smoothstep(.55,.8,d));
+  s.alb=mix(s.alb,vec3(.95,.9,.85),smoothstep(.9,.98,lat));
+ }else if(type<2.5){ // Eis
+  s.alb=mix(vec3(.6,.75,.9),vec3(.95,.98,1.),h);float cr=abs(fbm(q*6.+seed,4)-.5);s.alb=mix(vec3(.2,.35,.55),s.alb,smoothstep(.0,.05,cr));s.rough=.3;
+ }else if(type<3.5){ // Lava
+  float cr=abs(fbm(q*5.+seed,5)-.5);float l=smoothstep(.07,.0,cr);s.alb=mix(vec3(.04,.02,.02)*(.5+h),vec3(1.,.3,.04),l);s.water=l; // water=emissive
+ }else{ // Ozeanwelt
+  s.water=1.;s.alb=mix(vec3(.0,.18,.35),vec3(.0,.5,.6),fbm(q*3.+seed,4));
+ }
+ return s;}
+vec3 gasBands(vec3 q,out float tur){
+ float y=q.y;float w=fbm(vec3(q.x*2.,y*3.,q.z*2.)+seed,4);float yy=y*7.+w*1.1+sin(y*2.+seed)*.3;
+ float a=fbm(vec3(0.,yy*1.1,seed),3);
+ float storm=smoothstep(.12,.0,length(vec2(q.x*1.+.2-.0,(y+.35))*vec2(1.2,3.)-vec2(0.,0.)));
+ vec3 c1=vec3(.78,.55,.34),c2=vec3(.93,.84,.68),c3=vec3(.55,.32,.2);
+ if(seed>.5){c1=vec3(.25,.45,.7);c2=vec3(.7,.85,.95);c3=vec3(.1,.2,.4);}
+ vec3 c=mix(mix(c1,c2,a),c3,smoothstep(.55,.85,fbm(vec3(0.,yy*2.3,seed+4.),3)));tur=w;
+ return c;}
+void main(){
+ vec2 uv=(gl_FragCoord.xy-.5*res)/res.y;
+ vec3 ro=vec3(0,0,-3.6*zoom);vec3 rd=normalize(vec3(uv,1.6));
+ mat3 R=rotY(yaw)*rotX(pitch);
+ vec3 sun=normalize(vec3(-.7,.35,-.6));
+ vec3 col=stars(rd);
+ // Ringebene (geneigt)
+ vec3 ringN=normalize(vec3(.15,1.,.25));
+ float rin=1.5,rout=2.5;
+ // Kugel
+ float b=dot(ro,rd),c=dot(ro,ro)-1.,disc=b*b-c;
+ float tS=1e9;vec3 pS;bool hit=disc>0.;
+ float radius=type>3.5&&type<4.5?1.:1.;
+ if(hit){tS=-b-sqrt(disc);pS=ro+rd*tS;}
+ // Ring-Schnitt
+ float tR=-dot(ro,ringN)/dot(rd,ringN);vec3 pR=ro+rd*tR;float rr=length(pR);bool ringHit=ring>.5&&tR>0.&&rr>rin&&rr<rout;
+ // Atmosphäre: Strahl-Nähe
+ float closest=length(ro+rd*max(-b,0.));
+ vec3 atmoCol=type<.5?vec3(.25,.5,1.):type<1.5?vec3(.9,.5,.3):type<2.5?vec3(.6,.8,1.):type<3.5?vec3(1.,.35,.1):type<4.5?vec3(1.,.8,.55):vec3(.2,.6,1.);
+ if(hit){
+  vec3 n=pS;vec3 q=R*n; // Objektraum-Normale (dreht mit)
+  vec3 alb;float rough=.8;float emis=0.;float spec=0.;
+  float cloud=0.;
+  if(type>3.5&&type<4.5){float tur;alb=gasBands(q,tur);cloud=0.;rough=1.;}
+  else{S s=surf(q);alb=s.alb;rough=s.rough;
+   if(type>2.5&&type<3.5)emis=s.water;
+   if(s.water>.5&&type!=3.)spec=1.;
+   // Normal-Bump aus Höhenfeld
+   float e=.004;float h0=s.h;float hx=surf(q+vec3(e,0,0)).h,hy=surf(q+vec3(0,e,0)).h,hz=surf(q+vec3(0,0,e)).h;
+   vec3 g=vec3(hx-h0,hy-h0,hz-h0)/e;g-=dot(g,q)*q;if(s.water>.5&&type!=3.)g*=.0;
+   vec3 qn=normalize(q-g*.03);n=normalize(n+(transpose(R)*(qn-q))*1.);
+   if(type<.5||type>4.5){cloud=smoothstep(.5,.78,fbm(q*2.6+vec3(time*.01,0,seed*5.),6))*(type>4.5?.85:.95);}
+   else if(type>0.5&&type<1.5)cloud=smoothstep(.62,.85,fbm(q*3.+seed*5.+vec3(time*.02,0,0),5))*.25;
+  }
+  float nl=max(dot(n,sun),0.);
+  float wrap=smoothstep(-.15,.25,dot(n,sun));
+  vec3 L=alb*(nl*1.25+.0)*vec3(1.,.96,.9);
+  // Wolken (leicht versetzt, eigener Schatten)
+  float cl=cloud*(.25+.9*nl);
+  L=mix(L,vec3(1.)*(.15+nl*1.1),cloud*.9);
+  // Spiegelung (Ozean)
+  vec3 hv=normalize(sun-rd);float sp=pow(max(dot(n,hv),0.),90.)*spec*(1.-cloud)*1.4;
+  L+=sp*vec3(1.,.95,.85);
+  // Nachtseite: Stadtlichter bei Erde, Lava glüht
+  float night=1.-wrap;
+  if(type<.5){float city=smoothstep(.55,.7,fbm(q*12.+seed,3))*step(.52,surf(q).h)*(1.-surf(q).ice);L+=vec3(1.,.75,.35)*city*night*.8*(1.-cloud);}
+  L+=vec3(1.,.35,.05)*emis*(.8+.6*fbm(q*9.+time*.2,3))*1.6;
+  // Fresnel-Atmosphäre
+  float fr=pow(1.-max(dot(n,-rd),0.),3.);
+  float scat=fr*(.25+wrap*1.2);
+  L+=atmoCol*scat*(type>3.5&&type<4.5?.6:1.2);
+  // Terminator-Rötung
+  col=L;
+ }
+ // Glow-Halo außerhalb der Kugel
+ if(disc<=0.){
+  float d=closest-1.;float halo=exp(-d*7.)*(.6+.4*dot(normalize(ro+rd*max(-b,0.)),sun));
+  col+=atmoCol*halo*.25*smoothstep(0.,.3,dot(normalize(ro+rd*max(-b,0.)),sun)+.6);
+ }
+ if(ringHit){
+  float u=(rr-rin)/(rout-rin);
+  float band=.5+.5*sin(u*70.+fbm(vec3(u*20.,seed,0.),3)*8.);band*=smoothstep(0.,.08,u)*smoothstep(1.,.88,u);
+  float gap=smoothstep(.48,.5,u)*smoothstep(.56,.54,u);band*=1.-gap*.9;
+  vec3 rc=mix(vec3(.55,.45,.35),vec3(.9,.82,.7),fbm(vec3(u*30.,seed,1.),3));
+  // Planetenschatten
+  float sh=1.;vec3 toSun=sun;float bb=dot(pR,toSun),cc=dot(pR,pR)-1.;if(bb*bb-cc>0.&&bb<0.)sh=.12;
+  vec3 rcol=rc*(.2+.9*sh)*band;
+  float lit=dot(ringN,sun);
+  float a=clamp(band*.85,0.,1.);
+  if(!hit||tR<tS){col=mix(col,rcol*1.4,a);}
+ }
+ col=1.-exp(-col*1.15);col=pow(col,vec3(.9));
+ col*=1.-dot(uv,uv)*.35;
+ o=vec4(col,1);}`;
+function sh(t,s){const x=gl.createShader(t);gl.shaderSource(x,s);gl.compileShader(x);if(!gl.getShaderParameter(x,gl.COMPILE_STATUS)){console.error(gl.getShaderInfoLog(x));window.__shErr=gl.getShaderInfoLog(x)}return x}
+const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,VS));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,FS));gl.bindAttribLocation(p,0,'p');gl.linkProgram(p);gl.useProgram(p);
+const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+const U=n=>gl.getUniformLocation(p,n);const u={res:U('res'),time:U('time'),seed:U('seed'),type:U('type'),ring:U('ring'),yaw:U('yaw'),pitch:U('pitch'),zoom:U('zoom')};
+const TYPES=[['Erdähnliche Welt',0,'Ozeane, Kontinente, Wolken, Polkappen, Stadtlichter'],['Wüstenwelt',1,'Staubig, rötlich, dünne Atmosphäre'],['Eiswelt',2,'Gefrorene Kruste mit Rissen'],['Lavawelt',3,'Glühende Spalten auf Basalt'],['Gasriese',4,'Wolkenbänder, Ringe möglich'],['Ozeanwelt',5,'Globaler Ozean unter Wolken']];
+const NAMES1=['Ka','Zor','Vel','Ny','Ar','Tha','Mir','Ox','Eri','Sol'],NAMES2=['ron','dara','thos','ia','mere','ux','lune','ptis','gon','via'];
+const st={type:0,seed:Math.random()*10,ring:0,yaw:.6,pitch:.25,zoom:1,vy:.12,drag:false,idx:0};
+const ui=document.getElementById('ui'),info=document.getElementById('info');
+function name(){const r=((st.seed*1000)|0);return NAMES1[r%10]+NAMES2[(r>>3)%10]+'-'+(100+(r%900))}
+function refresh(){[...ui.querySelectorAll('button[data-t]')].forEach(b=>b.classList.toggle('on',+b.dataset.t===st.type));
+ const t=TYPES.find(x=>x[1]===st.type);info.innerHTML=`<b>${name()}</b>${t[0]}<br>${t[2]}${st.ring?'<br>Ringsystem':''}`}
+TYPES.forEach(t=>{const b=document.createElement('button');b.textContent=t[0];b.dataset.t=t[1];b.onclick=()=>{st.type=t[1];if(t[1]===4)st.ring=Math.random()<.6?1:0;else st.ring=0;st.seed=Math.random()*10;refresh()};ui.appendChild(b)});
+const nb=document.createElement('button');nb.textContent='🎲 Neue Welt (gleicher Typ)';nb.onclick=()=>{st.seed=Math.random()*10;refresh()};ui.appendChild(nb);
+const rb=document.createElement('button');rb.textContent='Ringe an/aus';rb.onclick=()=>{st.ring=st.ring?0:1;refresh()};ui.appendChild(rb);
+addEventListener('keydown',e=>{if(e.key===' '){st.seed=Math.random()*10;refresh();e.preventDefault()}if(e.key.toLowerCase()==='r'){st.ring=st.ring?0:1;refresh()}});
+let lx=0,ly=0;canvas.addEventListener('pointerdown',e=>{st.drag=true;lx=e.clientX;ly=e.clientY;canvas.setPointerCapture(e.pointerId);canvas.style.cursor='grabbing'});
+canvas.addEventListener('pointerup',()=>{st.drag=false;canvas.style.cursor='grab'});
+canvas.addEventListener('pointermove',e=>{if(!st.drag)return;st.yaw-=(e.clientX-lx)*.006;st.pitch=Math.max(-1.3,Math.min(1.3,st.pitch+(e.clientY-ly)*.006));st.vy=0;lx=e.clientX;ly=e.clientY});
+canvas.addEventListener('wheel',e=>{st.zoom=Math.max(.45,Math.min(2.2,st.zoom*(1+Math.sign(e.deltaY)*.08)));e.preventDefault()},{passive:false});
+function resize(){const d=Math.min(devicePixelRatio||1,2);const w=Math.floor(innerWidth*d),h=Math.floor(innerHeight*d);if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}gl.viewport(0,0,w,h)}
+let last=performance.now();
+function frame(now){resize();const dt=(now-last)/1000;last=now;if(!st.drag){st.vy+=(.12-st.vy)*.02;st.yaw+=st.vy*dt}
+ gl.uniform2f(u.res,canvas.width,canvas.height);gl.uniform1f(u.time,now/1000);gl.uniform1f(u.seed,st.seed);gl.uniform1f(u.type,st.type);gl.uniform1f(u.ring,st.ring);gl.uniform1f(u.yaw,st.yaw);gl.uniform1f(u.pitch,st.pitch);gl.uniform1f(u.zoom,st.zoom);
+ gl.drawArrays(gl.TRIANGLES,0,3);requestAnimationFrame(frame)}
+refresh();requestAnimationFrame(frame);
+window.genesis=st;
+</script></body></html>

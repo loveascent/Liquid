@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kaffee und Sahne 3D</title>
+<style>
+html,body{margin:0;height:100%;background:#0a0a0c;overflow:hidden;font-family:system-ui,sans-serif;color:#e8dccb}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+#ui{position:fixed;left:14px;top:14px;display:flex;flex-direction:column;gap:6px;z-index:2}
+#ui button{background:#1a1208cc;color:#f1e3cc;border:1px solid #5a4630;border-radius:8px;padding:9px 14px;font:600 13px system-ui;cursor:pointer;text-align:left;backdrop-filter:blur(6px);user-select:none}
+#ui button:hover,#ui button.on{background:#3a2a14;border-color:#d9a867}
+#hint{position:fixed;left:14px;bottom:12px;font-size:12px;opacity:.7;line-height:1.5;z-index:2;user-select:none}
+#fps{position:fixed;right:14px;top:12px;font-size:12px;opacity:.5;z-index:2}
+#err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#f88;z-index:3}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="ui">
+ <button id="bPour">Sahne eingießen (halten / Leertaste)</button>
+ <button id="bStir">Umrühren (R)</button>
+ <button id="bReset">Neuer Kaffee (N)</button>
+</div>
+<div id="hint">Ziehen: Kamera drehen · Mausrad: Zoom<br>Echte 3D-Strömung: Sahne sinkt, rollt sich ein und vermischt sich</div>
+<div id="fps"></div>
+<div id="err">WebGL2 mit Float-Rendering wird nicht unterstützt.</div>
+<script>
+"use strict";
+const canvas=document.getElementById('c');
+const gl=canvas.getContext('webgl2',{antialias:false,alpha:false});
+if(!gl||!gl.getExtension('EXT_color_buffer_float')){document.getElementById('err').style.display='flex';throw 0}
+const NX=64,NY=40,NZ=64;          // Voxelgitter
+const ITER=16;                      // Druck-Iterationen
+const VS=`#version 300 es
+void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(p*2.-1.,0.,1.);}`;
+const HDR=`#version 300 es
+precision highp float;precision highp sampler3D;
+out vec4 o;
+uniform vec3 N;uniform int layer;
+const float RC=30.,FL=2.,TOP=36.;
+ivec3 cell(){return ivec3(ivec2(gl_FragCoord.xy),layer);}
+bool solid(ivec3 c){if(float(c.y)<FL||float(c.y)>=TOP)return true;vec2 d=vec2(c.xz)+.5-N.xz*.5;return dot(d,d)>RC*RC;}
+`;
+function sh(t,s){const x=gl.createShader(t);gl.shaderSource(x,s);gl.compileShader(x);if(!gl.getShaderParameter(x,gl.COMPILE_STATUS)){window.__err=gl.getShaderInfoLog(x);console.error(window.__err)}return x}
+function mkProg(fs){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,VS));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);
+ if(!gl.getProgramParameter(p,gl.LINK_STATUS)){window.__err=gl.getProgramInfoLog(p);console.error(window.__err)}p.u={};return p}
+const loc=(p,n)=>(n in p.u)?p.u[n]:(p.u[n]=gl.getUniformLocation(p,n));
+
+// ---------- Simulation ----------
+const P_ADV=mkProg(HDR+`uniform sampler3D F;uniform float dt;
+void main(){ivec3 c=cell();if(solid(c)){o=vec4(0);return;}
+ vec4 v=texelFetch(F,c,0);
+ vec3 back=vec3(c)-dt*v.xyz;
+ vec4 r=texture(F,(back+.5)/N);
+ r.xyz*=exp(-dt*.35);
+ o=r;}`);
+const P_CURL=mkProg(HDR+`uniform sampler3D F;
+vec3 V(ivec3 c){return solid(c)?vec3(0):texelFetch(F,c,0).xyz;}
+void main(){ivec3 c=cell();if(solid(c)){o=vec4(0);return;}
+ ivec3 X=ivec3(1,0,0),Y=ivec3(0,1,0),Z=ivec3(0,0,1);
+ vec3 cu=.5*vec3(V(c+Y).z-V(c-Y).z-(V(c+Z).y-V(c-Z).y),
+                 V(c+Z).x-V(c-Z).x-(V(c+X).z-V(c-X).z),
+                 V(c+X).y-V(c-X).y-(V(c+Y).x-V(c-Y).x));
+ o=vec4(cu,length(cu));}`);
+const P_FORCE=mkProg(HDR+`uniform sampler3D F,C;uniform float dt,time,pour,stir;uniform vec2 src;
+float h(vec3 p){return fract(sin(dot(p,vec3(12.9898,78.233,37.719)))*43758.5453);}
+float cm(ivec3 q){return solid(q)?0.:texelFetch(C,q,0).w;}
+void main(){ivec3 c=cell();if(solid(c)){o=vec4(0);return;}
+ vec4 v=texelFetch(F,c,0);vec3 cu=texelFetch(C,c,0).xyz;
+ ivec3 X=ivec3(1,0,0),Y=ivec3(0,1,0),Z=ivec3(0,0,1);
+ vec3 g=.5*vec3(cm(c+X)-cm(c-X),cm(c+Y)-cm(c-Y),cm(c+Z)-cm(c-Z));
+ vec3 nn=g/(length(g)+1e-5);
+ v.xyz+=dt*4.5*cross(nn,cu);            // Wirbelverstärkung
+ v.y-=dt*11.*v.w;                        // Sahne ist schwerer: sinkt
+ vec3 p=vec3(c)+.5;
+ // Eingiessen
+ vec2 dd=p.xz-src;float fr=exp(-dot(dd,dd)/7.);float vb=smoothstep(TOP-9.,TOP-2.,p.y);
+ float k=pour*fr*vb;
+ vec3 nz=(vec3(h(p+time),h(p+time+1.),h(p+time+2.))-.5)*30.;
+ v.xyz=mix(v.xyz,vec3(0.,-21.,0.)+nz,clamp(k*.55,0.,1.));
+ v.w=min(v.w+k*dt*10.,1.);
+ // Löffel
+ if(stir>0.){float a=time*3.2;vec2 sp=N.xz*.5+.45*RC*vec2(cos(a),sin(a));vec2 d2=p.xz-sp;
+  float f2=exp(-dot(d2,d2)/14.)*smoothstep(7.,16.,p.y)*stir;
+  v.xz=mix(v.xz,vec2(-sin(a),cos(a))*42.,clamp(f2*.5,0.,1.));}
+ o=v;}`);
+const P_DIV=mkProg(HDR+`uniform sampler3D F;
+vec3 V(ivec3 c){return solid(c)?vec3(0):texelFetch(F,c,0).xyz;}
+void main(){ivec3 c=cell();if(solid(c)){o=vec4(0);return;}
+ float d=.5*(V(c+ivec3(1,0,0)).x-V(c-ivec3(1,0,0)).x+V(c+ivec3(0,1,0)).y-V(c-ivec3(0,1,0)).y+V(c+ivec3(0,0,1)).z-V(c-ivec3(0,0,1)).z);
+ o=vec4(d,0,0,0);}`);
+const P_PRESS=mkProg(HDR+`uniform sampler3D Pp,D;
+void main(){ivec3 c=cell();if(solid(c)){o=vec4(0);return;}
+ float pc=texelFetch(Pp,c,0).x;
+ float s=0.;ivec3 e[6]=ivec3[6](ivec3(1,0,0),ivec3(-1,0,0),ivec3(0,1,0),ivec3(0,-1,0),ivec3(0,0,1),ivec3(0,0,-1));
+ for(int i=0;i<6;i++){ivec3 q=c+e[i];s+=solid(q)?pc:texelFetch(Pp,q,0).x;}
+ o=vec4((s-texelFetch(D,c,0).x)/6.,0,0,0);}`);
+const P_PROJ=mkProg(HDR+`uniform sampler3D F,Pp;
+float Q(ivec3 q,float pc){return solid(q)?pc:texelFetch(Pp,q,0).x;}
+void main(){ivec3 c=cell();if(solid(c)){o=vec4(0);return;}
+ vec4 v=texelFetch(F,c,0);float pc=texelFetch(Pp,c,0).x;
+ vec3 g=.5*vec3(Q(c+ivec3(1,0,0),pc)-Q(c-ivec3(1,0,0),pc),Q(c+ivec3(0,1,0),pc)-Q(c-ivec3(0,1,0),pc),Q(c+ivec3(0,0,1),pc)-Q(c-ivec3(0,0,1),pc));
+ v.xyz-=g;o=v;}`);
+
+function tex3(){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_3D,t);gl.texStorage3D(gl.TEXTURE_3D,1,gl.RGBA16F,NX,NY,NZ);
+ gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+ for(const w of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T,gl.TEXTURE_WRAP_R])gl.texParameteri(gl.TEXTURE_3D,w,gl.CLAMP_TO_EDGE);return t}
+let F=[tex3(),tex3()],PR=[tex3(),tex3()];const DV=tex3(),CU=tex3();
+const fbo=gl.createFramebuffer();
+function bindT(p,name,tex,unit){gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_3D,tex);gl.uniform1i(loc(p,name),unit)}
+function pass(p,target,pre){gl.useProgram(p);gl.uniform3f(loc(p,'N'),NX,NY,NZ);pre&&pre();gl.viewport(0,0,NX,NY);gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+ const lz=loc(p,'layer');for(let z=0;z<NZ;z++){gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,target,0,z);gl.uniform1i(lz,z);gl.drawArrays(gl.TRIANGLES,0,3)}}
+function clearAll(){gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);for(const t of [...F,...PR,DV,CU])for(let z=0;z<NZ;z++){gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,t,0,z);gl.clearBufferfv(gl.COLOR,0,[0,0,0,0])}}
+const S={time:0,pour:0,stir:0};
+function simStep(dt){
+ pass(P_ADV,F[1],()=>{bindT(P_ADV,'F',F[0],0);gl.uniform1f(loc(P_ADV,'dt'),dt)});[F[0],F[1]]=[F[1],F[0]];
+ pass(P_CURL,CU,()=>bindT(P_CURL,'F',F[0],0));
+ const a=S.time*.35;
+ pass(P_FORCE,F[1],()=>{bindT(P_FORCE,'F',F[0],0);bindT(P_FORCE,'C',CU,1);gl.uniform1f(loc(P_FORCE,'dt'),dt);gl.uniform1f(loc(P_FORCE,'time'),S.time);
+  gl.uniform1f(loc(P_FORCE,'pour'),S.pour);gl.uniform1f(loc(P_FORCE,'stir'),S.stir);gl.uniform2f(loc(P_FORCE,'src'),32+30*.34*Math.cos(a),32+30*.34*Math.sin(a)*.7)});[F[0],F[1]]=[F[1],F[0]];
+ pass(P_DIV,DV,()=>bindT(P_DIV,'F',F[0],0));
+ for(let i=0;i<ITER;i++){pass(P_PRESS,PR[1],()=>{bindT(P_PRESS,'Pp',PR[0],0);bindT(P_PRESS,'D',DV,1)});[PR[0],PR[1]]=[PR[1],PR[0]]}
+ pass(P_PROJ,F[1],()=>{bindT(P_PROJ,'F',F[0],0);bindT(P_PROJ,'Pp',PR[0],1)});[F[0],F[1]]=[F[1],F[0]];
+}
+
+// ---------- Rendering ----------
+const RFS=`#version 300 es
+precision highp float;precision highp sampler3D;
+out vec4 o;
+uniform sampler3D F;uniform vec2 res;uniform float yaw,pitch,dist,time,pour,stir;uniform vec2 srcW,spoonW;
+const vec3 N=vec3(64.,40.,64.);const float RC=30.,FL=2.,TOP=36.;
+const float LH=(TOP-FL)/RC;const float GH=1.5;const float TY=-.12;
+vec3 env(vec3 d){float w=smoothstep(.6,.92,dot(d,normalize(vec3(-.5,.55,.65))));
+ float w2=smoothstep(.75,.95,dot(d,normalize(vec3(.7,.35,-.4))))*.35;
+ vec3 base=mix(vec3(.03,.03,.035),vec3(.22,.24,.28),clamp(d.y*.5+.5,0.,1.));
+ return base+vec3(1.6,1.5,1.35)*w+vec3(.8,.9,1.)*w2;}
+vec2 cyl(vec3 ro,vec3 rd,float R){float a=dot(rd.xz,rd.xz)+1e-6;float b=dot(ro.xz,rd.xz);float c=dot(ro.xz,ro.xz)-R*R;float h=b*b-a*c;
+ if(h<0.)return vec2(1e9,-1e9);h=sqrt(h);return vec2((-b-h)/a,(-b+h)/a);}
+float dens(vec3 q){vec3 cp=vec3(q.x*RC+32.,q.y*RC+FL,q.z*RC+32.);return texture(F,cp/N).w;}
+float hash(vec2 p){return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453);}
+void main(){
+ vec2 p=(gl_FragCoord.xy-.5*res)/res.y;
+ vec3 ta=vec3(0.,.78,0.);
+ vec3 ro=ta+dist*vec3(cos(pitch)*sin(yaw),sin(pitch),cos(pitch)*cos(yaw));
+ vec3 fw=normalize(ta-ro),rt=normalize(cross(fw,vec3(0,1,0))),up=cross(rt,fw);
+ vec3 rd=normalize(fw*1.7+p.x*rt+p.y*up);
+ vec3 Ld=normalize(vec3(-.45,.8,.5));
+ // Hintergrund + Tisch
+ vec3 bg=mix(vec3(.015,.015,.02),vec3(.07,.075,.09),clamp(rd.y*.6+.4,0.,1.));
+ vec3 col=bg;
+ if(rd.y<0.){float tt=(TY-ro.y)/rd.y;vec3 q=ro+rd*tt;float rr=length(q.xz);
+  float g=.5+.5*sin(q.x*6.+2.5*sin(q.z*.8)+sin(q.z*13.)*.3);g=g*.65+.35*hash(vec2(floor(q.x*3.),0.));
+  vec3 wood=mix(vec3(.09,.05,.028),vec3(.22,.125,.07),g);
+  float sh=smoothstep(.95,2.6,rr)*.85+.15;
+  float fr=.03+.5*pow(1.+rd.y,4.);
+  vec3 tc=wood*sh*(.5+.8*max(dot(vec3(0,1,0),Ld),0.))+env(reflect(rd,vec3(0,1,0)))*fr*.5*sh;
+  col=mix(tc,bg,1.-exp(-tt*.045));}
+ // Volumen
+ vec2 tc=cyl(ro,rd,1.);
+ vec2 tyv=vec2((0.-ro.y)/rd.y,(LH-ro.y)/rd.y);if(tyv.x>tyv.y)tyv=tyv.yx;
+ float t0=max(max(tc.x,tyv.x),0.),t1=min(tc.y,tyv.y);
+ bool hv=(t1>t0)&&(tc.y>0.);
+ vec3 vol=vec3(0.);float Tv=1.;float tEnter=1e9;
+ if(hv){tEnter=t0;
+  const int S=84;float st=(t1-t0)/float(S);float jit=hash(gl_FragCoord.xy+fract(time));
+  for(int i=0;i<S;i++){float t=t0+(float(i)+jit)*st;vec3 q=ro+rd*t;
+   float d=clamp(dens(q),0.,1.2);
+   float sd=8.5*d,sc=1.7,sig=sc+sd;
+   float Ls=dens(q+Ld*.09)+dens(q+Ld*.22);
+   float lit=exp(-Ls*3.2);
+   lit*=mix(.5,1.,smoothstep(0.,LH,q.y));
+   float mw=sd/sig;
+   vec3 Sc=mix(vec3(.085,.045,.022)*(.45+.55*lit),vec3(1.1,.97,.8)*(.25+.85*lit),mw);
+   float a=exp(-sig*st);vol+=Tv*(1.-a)*Sc;Tv*=a;
+   if(Tv<.01)break;}
+  float tTop=(LH-ro.y)/rd.y;
+  if(rd.y<0.&&ro.y>LH&&abs(t0-tTop)<1e-3){
+   vec3 qs=ro+rd*t0;float sd0=clamp(dens(qs-vec3(0,.05,0)),0.,1.);
+   float fr=.04+.96*pow(1.+rd.y,5.);
+   vol+=env(reflect(rd,vec3(0,1,0)))*fr*(1.-sd0*.75)*.9;}
+ }
+ vec3 res3=vol+Tv*col;
+ // Glas
+ vec2 go=cyl(ro,rd,1.07);
+ if(go.y>0.){
+  float tg=go.x>0.?go.x:0.;
+  if(go.x>0.){vec3 q=ro+rd*go.x;if(q.y>TY&&q.y<GH){vec3 n=normalize(vec3(q.x,0,q.z));
+   float f=.035+.9*pow(1.-abs(dot(n,rd)),4.);res3+=env(reflect(rd,n))*f*.8;res3+=smoothstep(.03,0.,abs(q.y-GH))*vec3(.5,.5,.55)*.6;}}
+  vec3 qb=ro+rd*go.y;if(qb.y>TY&&qb.y<GH){vec3 n=-normalize(vec3(qb.x,0,qb.z));
+   float f=.02+.5*pow(1.-abs(dot(n,rd)),4.);res3+=env(reflect(rd,n))*f*.35;}
+ }
+ // Sahne-Strahl
+ if(pour>.02){
+  vec2 ts=cyl(ro-vec3(srcW.x,0.,srcW.y),rd,.04+.02*pour);
+  if(ts.y>0.){float t=ts.x>0.?ts.x:ts.y;vec3 q=ro+rd*t;
+   if(q.y>LH&&q.y<4.&&t<tEnter){
+    vec3 n=normalize(vec3(q.x-srcW.x,0,q.z-srcW.y));
+    float lit=.5+.6*max(dot(n,Ld),0.);
+    vec3 sc=vec3(.96,.9,.78)*lit+env(reflect(rd,n))*.25;
+    res3=mix(res3,sc,clamp(pour*1.2,0.,1.));}}
+ }
+ // Löffel
+ if(stir>.02){
+  vec2 ts=cyl(ro-vec3(spoonW.x,0.,spoonW.y),rd,.05);
+  if(ts.y>0.){float t=ts.x>0.?ts.x:ts.y;vec3 q=ro+rd*t;
+   if(q.y>.35&&q.y<2.4){vec3 n=normalize(vec3(q.x-spoonW.x,0,q.z-spoonW.y));
+    vec3 sc=env(reflect(rd,n))*.9+vec3(.12);
+    float vis=(q.y>LH)?(t<tEnter?1.:.0):.3;
+    res3=mix(res3,sc,vis*clamp(stir,0.,1.));}}
+ }
+ vec3 c=res3;c=c*(2.51*c+.03)/(c*(2.43*c+.59)+.14);c=pow(clamp(c,0.,1.),vec3(1./2.2));
+ c*=1.-.35*dot(p,p);
+ o=vec4(c,1);}`;
+const RP=mkProg(RFS);
+
+// ---------- Eingabe ----------
+const st={yaw:.55,pitch:.32,dist:6.3,drag:false,auto:true,hold:false,stirT:0};
+let lx=0,ly=0;
+canvas.addEventListener('pointerdown',e=>{st.drag=true;lx=e.clientX;ly=e.clientY;canvas.setPointerCapture(e.pointerId);canvas.style.cursor='grabbing'});
+canvas.addEventListener('pointerup',()=>{st.drag=false;canvas.style.cursor='grab'});
+canvas.addEventListener('pointermove',e=>{if(!st.drag)return;st.yaw-=(e.clientX-lx)*.006;st.pitch=Math.max(-.05,Math.min(1.4,st.pitch+(e.clientY-ly)*.005));lx=e.clientX;ly=e.clientY});
+canvas.addEventListener('wheel',e=>{st.dist=Math.max(3.2,Math.min(10,st.dist*(1+Math.sign(e.deltaY)*.07)));e.preventDefault()},{passive:false});
+const bPour=document.getElementById('bPour'),bStir=document.getElementById('bStir'),bReset=document.getElementById('bReset');
+const pourOn=v=>{st.hold=v;st.auto=false;bPour.classList.toggle('on',v)};
+bPour.addEventListener('pointerdown',()=>pourOn(true));addEventListener('pointerup',()=>{if(st.hold)pourOn(false)});
+bStir.onclick=()=>{st.stirT=st.stirT>0?0:8};
+function reset(){clearAll();S.time=0;st.auto=true;st.stirT=0}
+bReset.onclick=reset;
+addEventListener('keydown',e=>{if(e.repeat)return;const k=e.key.toLowerCase();if(k===' '){pourOn(true);e.preventDefault()}if(k==='r')bStir.onclick();if(k==='n')reset()});
+addEventListener('keyup',e=>{if(e.key===' ')pourOn(false)});
+
+// ---------- Hauptschleife ----------
+const SCALE=.85;let last=performance.now(),fpsT=0,fpsN=0,tAuto=0;
+function frame(now){
+ const dt=Math.min((now-last)/1000,.05);last=now;tAuto+=dt;
+ const w=Math.floor(innerWidth*Math.min(devicePixelRatio||1,1.5)*SCALE),h=Math.floor(innerHeight*Math.min(devicePixelRatio||1,1.5)*SCALE);
+ if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}
+ const autoOn=st.auto&&S.time<3.2;
+ const target=(autoOn||st.hold)?1:0;S.pour+=(target-S.pour)*.12;
+ if(st.stirT>0)st.stirT-=dt;S.stir+=((st.stirT>0?1:0)-S.stir)*.1;
+ S.time+=1/60;simStep(1/60);
+ const a=S.time*.35,sx=.34*Math.cos(a),sz=.34*Math.sin(a)*.7;
+ const sa=S.time*3.2;
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,canvas.width,canvas.height);gl.useProgram(RP);
+ bindT(RP,'F',F[0],0);
+ gl.uniform2f(loc(RP,'res'),canvas.width,canvas.height);gl.uniform1f(loc(RP,'yaw'),st.yaw);gl.uniform1f(loc(RP,'pitch'),st.pitch);gl.uniform1f(loc(RP,'dist'),st.dist);
+ gl.uniform1f(loc(RP,'time'),now/1000);gl.uniform1f(loc(RP,'pour'),S.pour);gl.uniform1f(loc(RP,'stir'),S.stir);
+ gl.uniform2f(loc(RP,'srcW'),sx,sz);gl.uniform2f(loc(RP,'spoonW'),.45*Math.cos(sa),.45*Math.sin(sa));
+ gl.drawArrays(gl.TRIANGLES,0,3);
+ fpsT+=dt;fpsN++;if(fpsT>1){document.getElementById('fps').textContent=Math.round(fpsN/fpsT)+' fps';window.__fps=fpsN/fpsT;fpsT=0;fpsN=0}
+ requestAnimationFrame(frame)}
+clearAll();requestAnimationFrame(frame);
+window.coffee={S,st,simStep,reset};
+</script></body></html>
